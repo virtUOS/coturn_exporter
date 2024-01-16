@@ -1,0 +1,222 @@
+#!/usr/bin/python3
+
+import sys
+import os
+import tempfile
+import http.server
+import threading
+import subprocess
+import shutil
+import signal
+import time
+
+EXECUTABLE_NAME = 'turnutils_uclient'
+# Seconds until the executable receives SIGTERM
+TIMEOUT_SIGTERM = 100
+# Seconds after that until the executable receives SIGKILL
+TIMEOUT_SIGKILL = 5
+# Number of consecutive failures to determine the server status before HTTP
+# requests to /metrics will be responded to with 500 Internal Server Error
+MAX_FAILURES = 5
+
+def eprint(msg, /, **kwargs):
+  print(f'{sys.argv[0]}: {msg}', file=sys.stderr, **kwargs)
+
+def warn(msg, /, **kwargs):
+  eprint(f'warning: {msg}', **kwargs)
+
+def warn_exception(msg, e):
+  warn(msg + ':\n' + ''.join(traceback.format_exception(e)), end='')
+
+def error(msg, /, **kwargs):
+  eprint(f'error: {msg}', **kwargs)
+  sys.exit(1)
+
+if len(sys.argv) > 1:
+  error(f'expected 0 arguments, got {len(sys.argv) - 1}')
+
+try:
+  IP = os.environ['IP']
+except KeyError:
+  error('the environment variable IP must be set')
+PORT = os.environ.get('PORT', None)
+SECRET = os.environ.get('SECRET', None)
+try:
+  INTERVAL = int(os.environ.get('INTERVAL', 900))
+except ValueError:
+  error(
+    'invalid format for optional environment vairable INTERVAL (must be int)')
+if INTERVAL <= 0:
+  error('environment variable INTERVAL must be positive')
+
+executable_path = shutil.which(EXECUTABLE_NAME)
+if not executable_path:
+  error(f'could not locate {EXECUTABLE_NAME}')
+
+tempdir = tempfile.mkdtemp()
+os.chdir(tempdir)
+os.mkdir('server')
+
+shutdown_event = threading.Event()
+
+def shutdown_signal_handler(signum, frame):
+  eprint(f'received signal {signum}, shutting down')
+  shutdown_event.set()
+
+signal.signal(signal.SIGTERM, shutdown_signal_handler)
+signal.signal(signal.SIGINT, shutdown_signal_handler)
+
+class MetricsRequestHandler(http.server.BaseHTTPRequestHandler):
+  protocol_version = 'HTTP/1.1'
+  def _head_get_impl(self, include_body):
+    if self.path.split('?')[0].lower() not in ('/metrics', '/metrics/'):
+      self.send_error(404)
+      return
+    try:
+      with open('server/metrics', 'rb') as f:
+        mtime = os.fstat(f.fileno()).st_mtime
+        data = f.read()
+    except Exception:
+      self.send_error(500)
+      return
+    self.send_response(200)
+    self.send_header('Content-Length', str(len(data)))
+    self.send_header(
+      'Content-Type',
+      'application/openmetrics-text; version=1.0.0; charset=utf-8')
+    self.send_header(
+      'Last-Modified',
+      time.strftime('%a, %d %b %Y %H:%M:%S GMT', time.gmtime(mtime)))
+    self.end_headers()
+    if include_body:
+      self.wfile.write(data)
+  def do_HEAD(self):
+    self._head_get_impl(include_body=False)
+  def do_GET(self):
+    self._head_get_impl(include_body=True)
+
+server = http.server.ThreadingHTTPServer(
+  ('0.0.0.0', 80), MetricsRequestHandler)
+server_thread = threading.Thread(
+  target=server.serve_forever, name='server_thread', daemon=True)
+
+class ShutdownException(Exception):
+  pass
+
+def wait_and_check_shutdown(process, timeout):
+  wait_until = time.monotonic_ns() + timeout * 1e9
+  while True:
+    ex = None
+    try:
+      process.wait(0.1)
+    except subprocess.TimeoutExpired as e:
+      ex = e
+    if shutdown_event.is_set():
+      raise ShutdownException
+    if not ex:
+      return
+    if wait_until <= time.monotonic_ns():
+      raise ex
+
+failures = 0
+
+def check_failed():
+  if failures < MAX_FAILURES:
+    failures += 1
+    return
+  warn('too many consecutive failures, the metrics server now responds with '
+    '500 Internal Server Error')
+  try:
+    os.remove('server/metrics')
+  except FileNotFoundError:
+    pass
+  except Exception as e:
+    warn_exception('could not remove "server/metrics"', e)
+
+def check_succeeded(server_ok):
+  failures = 0
+  try:
+    with open('metrics_prep', 'wb') as f:
+      f.write(
+        b'# TYPE is_turnserver_ok gauge\n'
+        b'# HELP is_turnserver_ok Whether the TURN server is OK\n'
+        b'is_turnserver_ok %b %f\n'
+        b'# EOF\n'
+        % (b'1' if server_ok else b'0', time.time())
+      )
+    os.rename('metrics_prep', 'server/metrics') # Atomic replacement
+  except Exception as e:
+    warn_exception(
+      'failed to set up "metrics_prep" or to overwrite "server/metrics"', e)
+
+args = [
+  executable_path,
+  '-t',
+  *([] if PORT is None else ['-p', PORT]),
+  *([] if SECRET is None else ['-W', SECRET]),
+  '-e', IP,
+  '-c',
+  '-n', '0',
+  IP
+]
+
+# We run this in a separate thread and not just the main thread because...
+#   Traceback (most recent call last):
+#     File "/usr/local/bin/coturn_exporter", line 149, in <module>
+#       wait_and_check_shutdown(process, TIMEOUT_SIGTERM)
+#     File "/usr/local/bin/coturn_exporter", line 102, in wait_and_check_shutdown
+#       eprint('waiting') # Added temporarily for debugging
+#     File "/usr/local/bin/coturn_exporter", line 19, in eprint
+#       print(f'{sys.argv[0]}: {msg}', file=sys.stderr, **kwargs)
+#     File "/usr/local/bin/coturn_exporter", line 58, in shutdown_signal_handler
+#       eprint(f'received signal {signum}, shutting down')
+#     File "/usr/local/bin/coturn_exporter", line 19, in eprint
+#       print(f'{sys.argv[0]}: {msg}', file=sys.stderr, **kwargs)
+#   RuntimeError: reentrant call inside <_io.BufferedWriter name='<stderr>'>
+# ...apparently it's unsafe to print from the main thread if you also have a
+# signal handler that prints. (Signal handlers are always run from the main
+# thread.)
+def checker_thread_func():
+  while True:
+    # negative: failed to determine status, 0: is ok, positive: is not ok
+    # (NOTE: this is different from the exported boolean gauge, where 1 is ok
+    # and 0 is not ok)
+    check_result = None
+    process = subprocess.Popen(args)
+    try:
+      wait_and_check_shutdown(process, TIMEOUT_SIGTERM)
+    except (subprocess.TimeoutExpired, ShutdownException) as e:
+      if isinstance(e, subprocess.TimeoutExpired):
+        check_result = -1
+        warn(
+          f'{EXECUTABLE_NAME} could not determine the TURN server status '
+          f'within the timeout ({TIMEOUT_SECONDS} seconds), killing and '
+          'retrying')
+      process.terminate()
+      try:
+        process.wait(TIMEOUT_SIGKILL)
+      except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+    else:
+      check_result = process.returncode
+      if process.returncode < 0:
+        warn(
+          f'{EXECUTABLE_NAME} was terminated unexpectedly by signal '
+          f'{-process.returncode}, retrying')
+    if shutdown_event.is_set():
+      break
+    check_succeeded(check_result == 0) if check_result >= 0 else check_failed()
+    if shutdown_event.wait(INTERVAL if check_result >= 0 else 1):
+      break
+
+checker_thread = threading.Thread(
+  target=checker_thread_func, name='checker_thread', daemon=True)
+checker_thread.start()
+server_thread.start()
+checker_thread.join() # Terminated only by signal
+server.shutdown()
+server_thread.join()
+shutil.rmtree(tempdir)
+
+sys.exit(0)
