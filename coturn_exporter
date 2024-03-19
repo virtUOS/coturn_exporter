@@ -19,6 +19,26 @@ TIMEOUT_SIGKILL = 5
 # requests to /metrics will be responded to with 500 Internal Server Error
 MAX_FAILURES = 5
 
+# Stupid-yet-effective way to prevent errors of the sort
+# RuntimeError: reentrant call inside <_io.BufferedWriter name='<stderr>'>
+# when printing from different control flows (e.g., two different threads; or a
+# signal handler and a thread (even the main thread, where signal handlers are
+# executed); or two signal handlers)
+def make_write_reentrant(stream):
+  fd = stream.fileno()
+  def new_write(s, /):
+    b = s.encode('utf-8', 'ignore')
+    written = 0
+    with memoryview(b) as mv:
+      while written < len(mv):
+        with mv[written:] as remaining:
+          written += os.write(fd, remaining)
+    return len(s)
+  stream.write = new_write
+
+make_write_reentrant(sys.stdout)
+make_write_reentrant(sys.stderr)
+
 def eprint(msg, /, **kwargs):
   print(f'{sys.argv[0]}: {msg}', file=sys.stderr, **kwargs)
 
@@ -160,22 +180,6 @@ args = [
   IP
 ]
 
-# We run this in a separate thread and not just the main thread because...
-#   Traceback (most recent call last):
-#     File "/usr/local/bin/coturn_exporter", line 149, in <module>
-#       wait_and_check_shutdown(process, TIMEOUT_SIGTERM)
-#     File "/usr/local/bin/coturn_exporter", line 102, in wait_and_check_shutdown
-#       eprint('waiting') # Added temporarily for debugging
-#     File "/usr/local/bin/coturn_exporter", line 19, in eprint
-#       print(f'{sys.argv[0]}: {msg}', file=sys.stderr, **kwargs)
-#     File "/usr/local/bin/coturn_exporter", line 58, in shutdown_signal_handler
-#       eprint(f'received signal {signum}, shutting down')
-#     File "/usr/local/bin/coturn_exporter", line 19, in eprint
-#       print(f'{sys.argv[0]}: {msg}', file=sys.stderr, **kwargs)
-#   RuntimeError: reentrant call inside <_io.BufferedWriter name='<stderr>'>
-# ...apparently it's unsafe to print from the main thread if you also have a
-# signal handler that prints. (Signal handlers are always run from the main
-# thread.)
 def checker_thread_func():
   while True:
     # negative: failed to determine status, 0: is ok, positive: is not ok
