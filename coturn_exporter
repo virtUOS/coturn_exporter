@@ -80,11 +80,15 @@ os.mkdir('server')
 shutdown_event = threading.Event()
 
 def shutdown_signal_handler(signum, frame):
-  eprint(f'received signal {signum}, shutting down')
-  shutdown_event.set()
+  if not shutdown_event.is_set():
+    eprint(f'received signal {signum}, shutting down')
+    shutdown_event.set()
 
-signal.signal(signal.SIGTERM, shutdown_signal_handler)
+signal.signal(signal.SIGHUP, shutdown_signal_handler)
 signal.signal(signal.SIGINT, shutdown_signal_handler)
+signal.signal(signal.SIGPIPE, shutdown_signal_handler)
+signal.signal(signal.SIGTERM, shutdown_signal_handler)
+signal.signal(signal.SIGQUIT, shutdown_signal_handler)
 
 class MetricsRequestHandler(http.server.BaseHTTPRequestHandler):
   protocol_version = 'HTTP/1.1'
