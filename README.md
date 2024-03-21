@@ -1,9 +1,5 @@
 # README
 
-## Note
-
-🚨 **This was not yet tested!!** 🚨
-
 ## Running the Coturn Exporter
 
 ```bash
