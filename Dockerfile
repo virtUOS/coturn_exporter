@@ -1,4 +1,4 @@
-FROM coturn/coturn:4
+FROM docker.io/coturn/coturn:4
 
 USER root:root
 
