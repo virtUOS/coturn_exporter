@@ -120,7 +120,7 @@ class MetricsRequestHandler(http.server.BaseHTTPRequestHandler):
     self._head_get_impl(include_body=True)
 
 server = http.server.ThreadingHTTPServer(
-  ('0.0.0.0', 80), MetricsRequestHandler)
+  ('0.0.0.0', 9524), MetricsRequestHandler)
 server_thread = threading.Thread(
   target=server.serve_forever, name='server_thread', daemon=True)
 
