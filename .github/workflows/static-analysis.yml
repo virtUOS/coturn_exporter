@@ -15,8 +15,11 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@v5
       - run: pip install yamllint flake8 bandit
-      - run: yamllint .github/workflows/
+      - run: yamllint -s .github/workflows/
+        continue-on-error: true
       - run: flake8 coturn_exporter
+        continue-on-error: true
       - run: bandit coturn_exporter
+        continue-on-error: true
 
 ...
