@@ -2,7 +2,7 @@
 
 name: static-analysis
 
-on:
+'on':
   push:
   pull_request:
 
@@ -24,7 +24,7 @@ jobs:
       - run: bandit coturn_exporter
         id: bandit
         continue-on-error: true
-      - run: 'false' # Fail the workflow if one of the analyzers complained
+      - run: 'false'  # Fail the workflow if one of the analyzers complained
         if: >
           ${{ steps.yamllint.outcome != 'success' || steps.flake8.outcome !=
           'success' || steps.bandit.outcome != 'success' }}
