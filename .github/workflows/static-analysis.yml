@@ -17,14 +17,18 @@ jobs:
       - run: pip install yamllint flake8 bandit
       - run: yamllint -s .github/workflows/
         id: yamllint
+        name: yamllint
         continue-on-error: true
       - run: flake8 coturn_exporter
         id: flake8
+        name: flake8
         continue-on-error: true
       - run: bandit coturn_exporter
         id: bandit
+        name: bandit
         continue-on-error: true
       - run: 'false'  # Fail the workflow if one of the analyzers complained
+        name: Fail workflow
         if: |  # https://github.com/orgs/community/discussions/25641
           steps.yamllint.outcome != 'success' ||
           steps.flake8.outcome   != 'success' ||
