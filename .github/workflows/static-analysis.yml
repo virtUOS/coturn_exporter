@@ -25,8 +25,9 @@ jobs:
         id: bandit
         continue-on-error: true
       - run: 'false'  # Fail the workflow if one of the analyzers complained
-        if: >
-          ${{ steps.yamllint.outcome != 'success' || steps.flake8.outcome !=
-          'success' || steps.bandit.outcome != 'success' }}
+        if: |  # https://github.com/orgs/community/discussions/25641
+          steps.yamllint.outcome != 'success' ||
+          steps.flake8.outcome   != 'success' ||
+          steps.bandit.outcome   != 'success'
 
 ...
