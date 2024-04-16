@@ -14,4 +14,4 @@ USER nobody:nogroup
 ENTRYPOINT []
 CMD ["coturn_exporter"]
 
-EXPOSE 80/tcp
+EXPOSE 9524/tcp
