@@ -7,6 +7,7 @@ import subprocess
 import shutil
 import signal
 import time
+import logging
 import prometheus_client
 
 EXECUTABLE_NAME = 'turnutils_uclient'
@@ -24,6 +25,8 @@ MAX_FAILURES = 5
 # when printing from different control flows (e.g., two different threads; or a
 # signal handler and a thread (even the main thread, where signal handlers are
 # executed); or two signal handlers)
+# NOTE: It seems like the logging module tries to prevent this with its locks,
+# but it still happens in my testing.
 def make_write_reentrant(stream):
   fd = stream.fileno()
   def new_write(s, /):
@@ -39,45 +42,58 @@ def make_write_reentrant(stream):
 make_write_reentrant(sys.stdout)
 make_write_reentrant(sys.stderr)
 
-def eprint(msg, /, **kwargs):
-  print(f'{sys.argv[0]}: {msg}', file=sys.stderr, **kwargs)
+logger = logging.getLogger(__name__)
 
-def warn(msg, /, **kwargs):
-  eprint(f'warning: {msg}', **kwargs)
-
-def warn_exception(msg, e):
-  warn(msg + ':\n' + ''.join(traceback.format_exception(e)), end='')
-
-def error(msg, /, **kwargs):
-  eprint(f'error: {msg}', **kwargs)
-  sys.exit(1)
+def do_basic_logging_config(**kwargs):
+  logging.basicConfig(**kwargs, format=
+                      '[%(asctime)s] %(name)s %(levelname)s: %(message)s')
 
 if len(sys.argv) > 1:
-  error(f'expected 0 arguments, got {len(sys.argv) - 1}')
+  do_basic_logging_config()
+  logger.critical('expected 0 arguments, but got %d', len(sys.argv) - 1)
+  sys.exit(1)
 
+LOGLEVEL = os.environ.get('LOGLEVEL', None)
+if LOGLEVEL is None:
+  do_basic_logging_config(level=logging.WARNING)
+else:
+  if LOGLEVEL not in ('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'):
+    do_basic_logging_config()
+    logger.critical(
+      'invalid value for optional environment variable LOGLEVEL: %r (allowed '
+      "values are 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL')", LOGLEVEL)
+    sys.exit(1)
+  do_basic_logging_config(level=getattr(logging, LOGLEVEL))
 try:
   IP = os.environ['IP']
 except KeyError:
-  error('the environment variable IP must be set')
+  logger.critical('the environment variable IP must be set')
+  sys.exit(1)
 PORT = os.environ.get('PORT', None)
 SECRET = os.environ.get('SECRET', None)
+INTERVAL = os.environ.get('INTERVAL', 900)
 try:
-  INTERVAL = int(os.environ.get('INTERVAL', 900))
+  INTERVAL = int(INTERVAL)
 except ValueError:
-  error(
-    'invalid format for optional environment vairable INTERVAL (must be int)')
+  logger.critical(
+    'invalid format for optional environment vairable INTERVAL: %r (must be '
+    'int)', INTERVAL)
+  sys.exit(1)
 if INTERVAL <= 0:
-  error('environment variable INTERVAL must be positive')
+  logger.critical('environment variable INTERVAL must be positive, but got %d',
+                  INTERVAL)
+  sys.exit(1)
 
 executable_path = shutil.which(EXECUTABLE_NAME)
 if not executable_path:
-  error(f'could not locate {EXECUTABLE_NAME}')
+  logger.critical('could not locate execuable %r', EXECUTABLE_NAME)
+  sys.exit(1)
 
 shutdown_event = threading.Event()
 
 def shutdown_signal_handler(signum, frame):
   if not shutdown_event.is_set():
-    eprint(f'received signal {signum}, shutting down')
+    logger.info('received signal %d, shutting down', signum)
     shutdown_event.set()
 
 signal.signal(signal.SIGHUP, shutdown_signal_handler)
@@ -109,8 +125,8 @@ def failed():
   if failures < MAX_FAILURES:
     failures += 1
     return
-  warn('too many consecutive failures determining the server status, setting '
-    'to unknown')
+  logger.warning('too many consecutive failures determining the server status, '
+    'setting "turn_server_state" to "unknown"')
   turn_server_state_enum.state('unknown')
 while True:
   process = subprocess.Popen(args)
@@ -126,9 +142,9 @@ while True:
     break
   time_until_next_check = 1
   if process.returncode is None: # Still running
-    warn(
-      f'{EXECUTABLE_NAME} could not determine the TURN server status within '
-      f'the timeout ({TIMEOUT_SECONDS} seconds), killing and retrying')
+    logger.warning(
+      '%s could not determine the TURN server status within the timeout (%d '
+      'seconds), killing and retrying', EXECUTABLE_NAME, TIMEOUT_SIGTERM)
     failed()
     process.terminate()
     try:
@@ -138,14 +154,19 @@ while True:
       process.wait()
   else:
     if process.returncode < 0:
-      warn(
-        f'{EXECUTABLE_NAME} was terminated unexpectedly by signal '
-        f'{-process.returncode}, retrying')
+      logger.warning('%s was terminated unexpectedly by signal %d, retrying',
+                     EXECUTABLE_NAME, -process.returncode)
       failed()
     else:
       failures = 0
-      state, time_until_next_check = ('ok', INTERVAL) if process.returncode == 0 else ('unreachable', min(INTERVAL, 10))
-      turn_server_state_enum.state(state)
+      if process.returncode == 0:
+        turn_server_state_enum.state('ok')
+        time_until_next_check = INTERVAL
+        logger.info('%s said TURN server is ok', EXECUTABLE_NAME)
+      else:
+        turn_server_state_enum.state('unreachable')
+        time_until_next_check = min(INTERVAL, 10)
+        logger.info('%s said TURN server is unreachable', EXECUTABLE_NAME)
   if shutdown_event.wait(time_until_next_check):
     break
 
