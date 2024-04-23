@@ -99,7 +99,7 @@ signal.signal(signal.SIGQUIT, shutdown_signal_handler)
 
 prometheus_client.disable_created_metrics()
 turn_server_state_enum = prometheus_client.Enum('turn_server_state',
-  'the state of the TURN server', states=['ok', 'unreachable', 'unknown'])
+  'the state of the TURN server', states=['ok', 'not_ok', 'unknown'])
 turn_server_state_enum.state('unknown')
 server, server_thread = prometheus_client.start_http_server(SERVER_PORT)
 
@@ -159,9 +159,9 @@ while True:
         time_until_next_check = INTERVAL
         logger.info('%s said TURN server is ok', EXECUTABLE_NAME)
       else:
-        turn_server_state_enum.state('unreachable')
+        turn_server_state_enum.state('not_ok')
         time_until_next_check = min(INTERVAL, 10)
-        logger.info('%s said TURN server is unreachable', EXECUTABLE_NAME)
+        logger.info('%s said TURN server is not ok', EXECUTABLE_NAME)
   if shutdown_event.wait(time_until_next_check):
     break
 

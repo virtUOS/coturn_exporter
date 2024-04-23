@@ -19,6 +19,6 @@ Metrics are exported on port 9524. They will include something like the followin
 # HELP turn_server_state the state of the TURN server
 # TYPE turn_server_state gauge
 turn_server_state{turn_server_state="ok"} 1.0
-turn_server_state{turn_server_state="unreachable"} 0.0
+turn_server_state{turn_server_state="not_ok"} 0.0
 turn_server_state{turn_server_state="unknown"} 0.0
 ```
