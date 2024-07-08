@@ -18,7 +18,7 @@ RUN ln -st /usr/local/bin/ /coturn_exporter_files/coturn_exporter
 
 USER nobody:nogroup
 
-ENTRYPOINT []
-CMD ["coturn_exporter"]
+ENTRYPOINT ["coturn_exporter"]
+CMD []
 
 EXPOSE 9524/tcp

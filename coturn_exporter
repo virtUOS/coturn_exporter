@@ -2,12 +2,14 @@
 
 import sys
 import os
+import re
 import threading
-import subprocess
+import subprocess  # nosec B404
 import shutil
 import signal
 import time
 import logging
+import yaml
 import prometheus_client
 
 EXECUTABLE_NAME = 'turnutils_uclient'
@@ -21,11 +23,43 @@ TIMEOUT_SIGTERM = 100
 # Seconds after that until the executable receives SIGKILL
 TIMEOUT_SIGKILL = 5
 
+DEFAULT_LOGLEVEL = logging.WARNING
+
+DEFAULT_INTERVAL = 900
+
+# 3478 is the default port turnutils_uclient uses for unsecure connections
+# https://github.com/coturn/coturn/wiki/turnutils_uclient
+DEFAULT_TURN_PORT = 3478
+
+CONFIG_PATH = '/coturn_exporter_files/config'
+
 # Number of consecutive failures to determine the server status before
 # turn_server_state will be set to "unknown"
 MAX_FAILURES = 5
 
+NUM_HELPER = r'(?:[1-9]?\d|1\d\d|2[0-4]\d|25[0-5])'  # 0 to 255
+DOT_HELPER = fr'(?:{NUM_HELPER}\.)'
+IP_PATTERN = re.compile(
+    'localhost|' + DOT_HELPER + '(?:' + DOT_HELPER + '{2}){1,2}' + NUM_HELPER,
+    re.ASCII)
+
+exit_status = 0
+
 logger = logging.getLogger(__name__)
+
+executable_path = None
+
+
+def get_executable_path():
+    '''
+    Returns the full path for the executable EXECUTABLE_NAME
+    '''
+    global executable_path
+    if executable_path is None:
+        if (executable_path := shutil.which(EXECUTABLE_NAME)) is None:
+            logger.critical('could not locate executable %r', EXECUTABLE_NAME)
+            sys.exit(1)
+    return executable_path
 
 
 def make_write_reentrant(stream):
@@ -52,69 +86,217 @@ def make_write_reentrant(stream):
     stream.write = new_write
 
 
-def set_loglevel():
+def move_keys(d, *keys):
     '''
-    Configures the logger using the LOGLEVEL environment variable
+    Remove each of the listed keys from d (if present) and return a new dict
+    with those key-value-pairs.
     '''
-    loglevel = os.environ.get('LOGLEVEL', None)
-    if loglevel is None:
-        logging.getLogger().setLevel(logging.WARNING)
-    elif loglevel in ('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'):
-        logging.getLogger().setLevel(getattr(logging, loglevel))
+    r = {}
+    for k in keys:
+        try:
+            r[k] = d.pop(k)
+        except KeyError:
+            pass
+    return r
+
+
+def process_server(server, location):
+    '''
+    Validate information about a TURN server.
+
+    The first argument is assumed to be a dict. This function verifies that it
+    has at least the key 'ip' and at most also the keys 'port' and 'secret' and
+    that their values have the correct type and format.
+
+    If ok, returns the validated server info. If not, logs a critical error
+    message and terminates the program. The second argument is used to specify
+    where the invalid server description was found in the error messasge.
+    '''
+    r = {}
+    try:
+        ip = r['ip'] = server.pop('ip')
+    except KeyError:
+        logger.critical("no key 'ip' %s", location)
+        sys.exit(1)
+    if not isinstance(ip, str):
+        logger.critical("invalid type for key 'ip' %s: %s (must be str)",
+                        location, type(ip).__name__)
+        sys.exit(1)
+    if not IP_PATTERN.fullmatch(ip):
+        logger.critical(
+            "invalid value for key 'ip' %s: %r (not a valid IP)", location, ip)
+        sys.exit(1)
+    try:
+        port = r['port'] = server.pop('port')
+    except KeyError:
+        pass
     else:
-        logger.critical(
-            'invalid value for optional environment variable LOGLEVEL: %r '
-            "(allowed values are 'DEBUG', 'INFO', 'WARNING', 'ERROR', "
-            "'CRITICAL')", loglevel)
-        sys.exit(1)
-
-
-def get_int_envvar(name, default):
-    '''
-    Obtains the value of the environemnt variable given by name, converts it to
-    int, and returns the result. Returns default if it does not exist.
-    '''
+        if not isinstance(port, int):
+            logger.critical("invalid type for key 'port' %s: %s (must be int)",
+                            location, type(port).__name__)
+            sys.exit(1)
+        if port not in range(0, 65536):
+            logger.critical(
+                "invalid value for key 'port' %s: %d (must be in the range "
+                '[0, 65535])', location, port)
+            sys.exit(1)
     try:
-        value = os.environ[name]
+        secret = r['secret'] = server.pop('secret')
     except KeyError:
-        return default
-    try:
-        int_value = int(value)
-    except ValueError:
-        logger.critical(
-            'invalid format for optional environment vairable %s: %r (must be '
-            'int)', name, value)
+        pass
+    else:
+        if not isinstance(secret, str):
+            logger.critical(
+                "invalid type for key 'secret' %s: %s (must be str)",
+                location, type(secret).__name__)
+            sys.exit(1)
+    if server:
+        logger.critical('unexpected key(s) %s: %s', location,
+                        ', '.join(map(repr, server.keys())))
         sys.exit(1)
-    return int_value
+    return r
 
 
-def get_executable_path(name):
+def get_host_id(server):
     '''
-    Returns the full path for the executable given by name.
-    '''
-    path = shutil.which(name)
-    if path is None:
-        logger.critical('could not locate execuable %r', name)
-        sys.exit(1)
-    return path
-
-
-def get_executable_call_args():
-    '''
-    Build and return the argument list for the call to EXECUTABLE_NAME.
+    Helper function that creates a hashable identifier for a host. Also
+    indicates whether a port was explicitly specified or whether the default
+    value was inserted.
     '''
     try:
-        turn_server_ip = os.environ['IP']
+        return (server['ip'], server['port']), False
     except KeyError:
-        logger.critical('the environment variable IP must be set')
+        return (server['ip'], DEFAULT_TURN_PORT), True
+
+
+def host_id_to_str(host_id, force_no_port=False):
+    '''
+    Helper function that converts a hashable host identifier to a readable str.
+    '''
+    if len(host_id) == 1 or force_no_port:
+        return f'ip: {host_id[0]}'
+    return f'ip: {host_id[0]}, port: {host_id[1]}'
+
+
+def process_config(config):
+    '''
+    Process the result of parsing the YAML inside the config file: Apply
+    'loglevel' immediately and return a dict with 'interval' and 'turn_servers'
+    (possibly constructed from 'ip' [+ 'port'] [+ 'secret']). If the
+    configuration is invalid, log the error and exit.
+    '''
+    if config is None:
+        config = {}
+    elif not isinstance(config, dict):
+        logger.critical(
+            'top-level object in config file must be dict, but got %s',
+            type(config).__name__)
         sys.exit(1)
-    args = [
-        get_executable_path(EXECUTABLE_NAME), '-t', '-e', turn_server_ip, '-c',
-        '-n', '0', turn_server_ip]
-    if (turn_server_port := os.environ.get('PORT', None)) is not None:
-        args.extend(['-p', turn_server_port])
-    if (turn_server_secret := os.environ.get('SECRET', None)) is not None:
-        args.extend(['-W', turn_server_secret])
+    try:
+        loglevel = config.pop('loglevel')
+    except KeyError:
+        logging.getLogger().setLevel(DEFAULT_LOGLEVEL)
+    else:
+        if loglevel in ('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'):
+            logging.getLogger().setLevel(getattr(logging, loglevel))
+        else:
+            logger.critical(
+                "invalid value for optional config file key 'loglevel': %r "
+                "(allowed values are 'DEBUG', 'INFO', 'WARNING', 'ERROR', "
+                "'CRITICAL')", loglevel)
+            sys.exit(1)
+    try:
+        interval = config.pop('interval')
+    except KeyError:
+        interval = DEFAULT_INTERVAL
+    else:
+        if not isinstance(interval, (int, float)):
+            logger.critical(
+                "invalid type for optional config file key 'interval': %s "
+                "(must be int or float)", type(interval).__name__)
+            sys.exit(1)
+        elif interval <= 0:
+            logger.critical(
+                "invalid value for optional config file key 'interval': %r "
+                '(must be positive)', interval)
+            sys.exit(1)
+    try:
+        turn_servers = config.pop('turn_servers')
+    except KeyError:
+        if 'ip' not in config:
+            # Handle this here to give a more adequate error message
+            logging.critical(
+                "neither of the keys 'ip' and 'turn_servers' present in the "
+                'config file (exactly one of them is required)')
+            sys.exit(1)
+        processed_turn_servers = [process_server(
+            move_keys(config, 'ip', 'port', 'secret'),
+            'at the root level of the config file')]
+    else:
+        if 'ip' in config or 'port' in config or 'secret' in config:
+            logger.critical(
+                "when using the config file key 'turn_servers' you cannot "
+                "also use 'ip'/'port'/'secret' at the root level")
+            sys.exit(1)
+        if not isinstance(turn_servers, list):
+            logger.critical(
+                "invalid type for config file key 'turn_servers': %s (must be "
+                'list)', type(turn_servers).__name__)
+            sys.exit(1)
+        if not turn_servers:
+            logger.critical(
+                "config file list 'turn_servers' must not be empty")
+            sys.exit(1)
+        processed_turn_servers = []
+        for i, server in enumerate(turn_servers):
+            if not isinstance(server, dict):
+                logger.critical(
+                    "in the config file, the items of the 'turn_servers' list "
+                    'must be of type dict, but got %s at index %d',
+                    type(server).__name__, i)
+                sys.exit(1)
+            processed_turn_servers.append(process_server(
+                server,
+                f"at index {i} of the config file list 'turn_servers'"))
+        unique_servers = {}
+        for server in processed_turn_servers:
+            host_id, defaulted = get_host_id(server)
+            if host_id in unique_servers:
+                if defaulted == unique_servers[host_id]:
+                    logger.critical(
+                        'host %r appears multiple times in the config file '
+                        "list 'turn_servers'",
+                        host_id_to_str(host_id, defaulted))
+                else:
+                    logger.critical(
+                        'hosts %r and %r in the config file list '
+                        "'turn_servers' are equivalent because %d is the "
+                        'default port',
+                        host_id_to_str(host_id, unique_servers[host_id]),
+                        host_id_to_str(host_id, defaulted), DEFAULT_TURN_PORT
+                        )
+                sys.exit(1)
+            unique_servers[host_id] = defaulted
+    if config:
+        logger.critical(
+            'unexpected key(s) at the root level of the config file: %s',
+            ', '.join(map(repr, config.keys())))
+        sys.exit(1)
+    return {'interval': interval, 'turn_servers': processed_turn_servers}
+
+
+def get_executable_call_args(server):
+    '''
+    Build and return the argument list for the call to EXECUTABLE_NAME that
+    will check the state of the given server.
+    '''
+    args = [get_executable_path(), '-t', '-e', server['ip'], '-c', '-n', '0',
+            '-p', str(server.get('port', DEFAULT_TURN_PORT))]
+    try:
+        args.extend(['-W', server['secret']])
+    except KeyError:
+        pass
+    args.append(server['ip'])
     return args
 
 
@@ -134,7 +316,7 @@ def install_shutdown_signal_handlers(shutdown_event):
     signal.signal(signal.SIGQUIT, shutdown_signal_handler)
 
 
-def check_until_shutdown_event(*, args, interval, turn_server_state_enum,
+def check_until_shutdown_event(args, interval, turn_server_state_enum,
                                shutdown_event):
     '''
     Runs the executable using args every interval seconds to update the
@@ -152,7 +334,7 @@ def check_until_shutdown_event(*, args, interval, turn_server_state_enum,
         turn_server_state_enum.state('unknown')
 
     while True:
-        process = subprocess.Popen(args)
+        process = subprocess.Popen(args)  # nosec B603
         wait_until = time.monotonic_ns() + TIMEOUT_SIGTERM * 1e9
         while time.monotonic_ns() < wait_until and not shutdown_event.is_set():
             try:
@@ -163,7 +345,7 @@ def check_until_shutdown_event(*, args, interval, turn_server_state_enum,
                 break
         if shutdown_event.is_set():
             break
-        time_until_next_check = 1
+        seconds_until_next_check = 1
         if process.returncode is None:  # Still running
             logger.warning(
                 '%s could not determine the TURN server status within the '
@@ -186,15 +368,64 @@ def check_until_shutdown_event(*, args, interval, turn_server_state_enum,
                 failures = 0
                 if process.returncode == 0:
                     turn_server_state_enum.state('ok')
-                    time_until_next_check = interval
+                    seconds_until_next_check = interval
                     logger.info('%s said TURN server is ok', EXECUTABLE_NAME)
                 else:
                     turn_server_state_enum.state('not_ok')
-                    time_until_next_check = min(interval, 10)
+                    seconds_until_next_check = min(interval, 10)
                     logger.info('%s said TURN server is not ok',
                                 EXECUTABLE_NAME)
-        if shutdown_event.wait(time_until_next_check):
+        if shutdown_event.wait(seconds_until_next_check):
             break
+
+
+def exception_shutdown_wrapper(f, shutdown_event):
+    '''
+    Wraps the function f such that if it raises an exception, it is logged.
+    Additionally, when it finishes, the shutdown_event is set (no matter
+    whether it returned or raised).
+    '''
+    def g(*args, **kwargs):
+        try:
+            f(*args, **kwargs)
+        except Exception as e:
+            logger.critical(
+                'got unexpected exception in function %s, shutting down',
+                f.__name__, exc_info=e)
+            global exit_status
+            exit_status = 1
+        finally:
+            shutdown_event.set()
+    return g
+
+
+def create_checker_thread(server, interval, turn_server_state_enum,
+                          shutdown_event):
+    '''
+    Create and return a threading.Thread that when started will continuously
+    check the state of the server and update the enum with the results.
+    '''
+    host = f'{server["ip"]}:{server.get("port", DEFAULT_TURN_PORT)}'
+    enum_label = turn_server_state_enum.labels(host=host)
+    enum_label.state('unknown')
+    return threading.Thread(
+        target=exception_shutdown_wrapper(check_until_shutdown_event,
+                                          shutdown_event),
+        name=f'Checker Thread for {host}',
+        args=[get_executable_call_args(server), interval, enum_label,
+              shutdown_event])
+
+
+def each(f, it):
+    for el in it:
+        f(el)
+
+
+def call_without_exceptions(f, *args, **kwargs):
+    try:
+        f(*args, **kwargs)
+    except Exception:  # nosec B110
+        pass
 
 
 def main():
@@ -202,38 +433,57 @@ def main():
     make_write_reentrant(sys.stderr)
     logging.basicConfig(
         format='[%(asctime)s] %(name)s %(levelname)s: %(message)s')
-    if len(sys.argv) > 1:
-        logger.critical('expected 0 arguments, but got %d', len(sys.argv) - 1)
-        sys.exit(1)
-    set_loglevel()
-    interval = get_int_envvar('INTERVAL', 900)
-    if interval <= 0:
-        logger.critical(
-            'environment variable INTERVAL must be positive, but got %d',
-            interval)
-        sys.exit(1)
-    args = get_executable_call_args()
-    shutdown_event = threading.Event()
-    install_shutdown_signal_handlers(shutdown_event)
-    prometheus_client.disable_created_metrics()
-    turn_server_state_enum = prometheus_client.Enum(
-        'turn_server_state', 'the state of the TURN server',
-        states=['ok', 'not_ok', 'unknown'])
-    turn_server_state_enum.state('unknown')
-    server, server_thread = prometheus_client.start_http_server(
-        METRICS_SERVER_PORT)
     try:
-        check_until_shutdown_event(
-            args=args, interval=interval,
-            turn_server_state_enum=turn_server_state_enum,
-            shutdown_event=shutdown_event)
+        if len(sys.argv) > 1:
+            logger.critical(
+                'expected no arguments, but got %d', len(sys.argv) - 1)
+            sys.exit(1)
+        try:
+            with open(CONFIG_PATH, 'rt', encoding='utf-8') as config_file:
+                config = yaml.safe_load(config_file)
+        except Exception as e:
+            logger.critical('error when reading the config file at %r',
+                            CONFIG_PATH, exc_info=e)
+            sys.exit(1)
+        config = process_config(config)
+        shutdown_event = threading.Event()
+        install_shutdown_signal_handlers(shutdown_event)
+        prometheus_client.disable_created_metrics()
+        turn_server_state_enum = prometheus_client.Enum(
+            name='turnserver_state',
+            documentation='the state of the TURN server',
+            labelnames=['host'], states=['ok', 'not_ok', 'unknown'])
+        checker_threads = [create_checker_thread(server, config['interval'],
+                                                 turn_server_state_enum,
+                                                 shutdown_event)
+                           for server in config['turn_servers']]
+    except Exception as e:
+        logger.critical(
+            'got unexpected exception when setting up, aborting', exc_info=e)
+        sys.exit(1)
+    try:
+        each(lambda t: t.start(), checker_threads)
+        server, server_thread = prometheus_client.start_http_server(
+            METRICS_SERVER_PORT)
+        shutdown_event.wait()
+    except Exception as e:
+        logger.critical(
+            'got unexpected exception when starting the threads, shutting '
+            'down', exc_info=e)
+        global exit_status
+        exit_status = 1
     finally:
-        server.shutdown()
-        server_thread.join()
+        shutdown_event.set()
+        try:
+            server.shutdown()
+            server_thread.join()
+        except Exception:  # nosec B110
+            pass
+        each(lambda t: call_without_exceptions(t.join), checker_threads)
 
 
 if __name__ == '__main__':
     main()
-    sys.exit(0)
+    sys.exit(exit_status)
 else:
     raise ImportError('this is not a module')
