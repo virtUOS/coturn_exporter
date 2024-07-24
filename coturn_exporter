@@ -10,6 +10,7 @@ import signal
 import time
 import logging
 import yaml
+import itertools
 import prometheus_client
 
 EXECUTABLE_NAME = 'turnutils_uclient'
@@ -37,11 +38,10 @@ CONFIG_PATH = '/coturn_exporter_files/config'
 # turn_server_state will be set to "unknown"
 MAX_FAILURES = 5
 
-NUM_HELPER = r'(?:[1-9]?\d|1\d\d|2[0-4]\d|25[0-5])'  # 0 to 255
-DOT_HELPER = fr'(?:{NUM_HELPER}\.)'
-IP_PATTERN = re.compile(
-    'localhost|' + DOT_HELPER + '(?:' + DOT_HELPER + '{2}){1,2}' + NUM_HELPER,
+IPV4_HELPER_PATTERN = re.compile(
+    r'[1-9]?\d|1\d\d|2[0-4]\d|25[0-5]',  # 0 to 255
     re.ASCII)
+IPV6_HELPER_PATTERN = re.compile('[0-9a-fA-F]{1,4}')
 
 exit_status = 0
 
@@ -100,6 +100,36 @@ def move_keys(d, *keys):
     return r
 
 
+def is_ip(s):
+    '''
+    Return True if the passed string is a syntactically correct IPv4 or IPv6
+    address.
+    '''
+    if s == 'localhost':
+        return True
+    parts = s.split('.')
+    if len(parts) == 4:
+        for p in parts:
+            if not IPV4_HELPER_PATTERN.fullmatch(p):
+                return False
+        return True
+    metaparts = s.split('::')
+    if len(metaparts) > 2:
+        return False
+    parts = list(itertools.chain.from_iterable(
+        map(lambda mp: mp.split(':') if mp else [], metaparts)))
+    if len(metaparts) == 2:
+        if len(parts) > 7:
+            return False
+    else:
+        if len(parts) != 8:
+            return False
+    for p in parts:
+        if not IPV6_HELPER_PATTERN.fullmatch(p):
+            return False
+    return True
+
+
 def process_server(server, location):
     '''
     Validate information about a TURN server.
@@ -122,7 +152,7 @@ def process_server(server, location):
         logger.critical("invalid type for key 'ip' %s: %s (must be str)",
                         location, type(ip).__name__)
         sys.exit(1)
-    if not IP_PATTERN.fullmatch(ip):
+    if not is_ip(ip):
         logger.critical(
             "invalid value for key 'ip' %s: %r (not a valid IP)", location, ip)
         sys.exit(1)
